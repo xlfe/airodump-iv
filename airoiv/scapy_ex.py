@@ -3,22 +3,11 @@ A set of additions and modifications to scapy to assist in parsing dot11
 """
 import scapy
 
-from scapy.fields import BitField
-from scapy.fields import ByteField
-from scapy.fields import ConditionalField
-from scapy.fields import EnumField
-from scapy.fields import Field
-from scapy.fields import FieldLenField
-from scapy.fields import FieldListField
-from scapy.fields import FlagsField
-from scapy.fields import LEFieldLenField
-from scapy.fields import LELongField
-from scapy.fields import LEShortField
-from scapy.fields import StrFixedLenField
+from scapy.fields import *
 from scapy.layers.dot11 import Dot11Elt
 from scapy.layers.dot11 import Dot11ProbeReq
 from scapy.packet import Packet
-
+from collections import OrderedDict
 from printer import Printer
 
 
@@ -33,6 +22,10 @@ class LESignedShortField(Field):
 	def __init__(self, name, default):
 		Field.__init__(self, name, default, '<h')
 
+def scapy_flags_field_hasflag(self, pkt, x, val):
+	return val in self.i2repr(pkt, x)
+FlagsField.hasflag = scapy_flags_field_hasflag
+del scapy_flags_field_hasflag
 
 def scapy_packet_Packet_hasflag(self, field_name, value):
 	"""Is the specified flag value set in the named field"""
@@ -46,6 +39,42 @@ def scapy_packet_Packet_hasflag(self, field_name, value):
 scapy.packet.Packet.hasflag = scapy_packet_Packet_hasflag
 del scapy_packet_Packet_hasflag
 
+# fix scapy's endianness problem on big-endian host (make rev effective)
+def scapy_fields_BitField_getfield(self, pkt, s):
+		if type(s) is tuple:
+			s,bn = s
+		else:
+			bn = 0
+		# we don't want to process all the string
+		nb_bytes = (self.size+bn-1)/8 + 1
+		w = s[:nb_bytes]
+
+		# split the substring byte by byte
+		bytes = struct.unpack('!%dB' % nb_bytes , w)
+
+		if self.rev:
+			bytes = list(reversed(bytes))
+
+		b = 0L
+		for c in range(nb_bytes):
+			b |= long(bytes[c]) << (nb_bytes-c-1)*8
+
+		# get rid of high order bits
+		b &= (1L << (nb_bytes*8-bn)) - 1
+
+		# remove low order bits
+		b = b >> (nb_bytes*8 - self.size - bn)
+
+		bn += self.size
+		s = s[bn/8:]
+		bn = bn%8
+		b = self.m2i(pkt, b)
+		if bn:
+			return (s,bn),b
+		else:
+			return s,b
+BitField.getfield = scapy_fields_BitField_getfield
+del scapy_fields_BitField_getfield
 
 def scapy_fields_FieldListField_i2repr(self, pkt, x):
 	"""Return a list with the representation of contained fields"""
@@ -60,11 +89,102 @@ class ChannelFromMhzField(LEShortField):
 		return min(14, max(1, (x - 2407) / 5))
 
 
-class PresentFlagField(ConditionalField):
-	"""Utility field for use by RadioTap"""
-	def __init__(self, field, flag_name):
-		ConditionalField.__init__(self, field, lambda pkt: pkt.hasflag('present', flag_name))
+class PresentFlagsField(FieldListField):
+	def __init__(self, name, default, field, length_from=None, count_from=None):
+		FieldListField.__init__(self, name, default, field, length_from=None, count_from=None)
 
+	def getfield(self, pkt, s):
+		if self.length_from is not None or self.count_from is not None:
+			# Printer.write("FieldListField.getfield called")
+			return FieldListField.getfield(self, packet, s)
+		# Printer.write("PresentFlagsField.getfield called")
+		val=[]
+		while s:
+			s, v = self.field.getfield(pkt, s)
+			# Printer.write('PresentFlagsField.getfield: {0:08X}'.format(v))
+			val.append(v)
+			if not self.field.hasflag(pkt, v, 'Ext'):
+				break
+		return s, val
+
+def packet_hasPresentFlag(self, value, index=0):
+	field, val = self.getfield_and_val('Present_flags')
+	return field.field.hasflag(self, val[index], value)
+
+# adjust offset to read field data when alignment required
+class AlignedField:
+	def __init__(self, fld, align=None):
+		if align is None:
+			align = fld.sz # TODO: round size to nature bound
+		self.align = align
+		self.fld = fld
+
+	def getfield(self, pkt, s):
+		remain = (pkt.pre_dissect_len - len(s)) % self.align
+		if remain:
+			s = s[self.align - remain:]
+		return self.fld.getfield(pkt, s)
+
+	def __getattr__(self, attr):
+		return getattr(self.fld, attr)
+
+class PresentField(ConditionalField):
+	"""Utility field for use by RadioTap"""
+	def __init__(self, field, flag_name, index = 0):
+		ConditionalField.__init__(self, field, lambda pkt: packet_hasPresentFlag(pkt, flag_name, index))
+
+class RTapFields(Field):
+	def __init__(self, name, default, flds, index = 0):
+		if default is None:
+			default = []
+		Field.__init__(self, name, default)
+		self.flds = []
+		self.index = index # position in all RTapFields List
+		for field, flag_name in flds:
+			self.flds.append(PresentField(field, flag_name, index))
+
+	def getfield(self, pkt, s):
+		val = OrderedDict()
+		for field in self.flds:
+			s,v = field.getfield(pkt, s)
+			val[field.name] = v
+		return s, val
+
+	def i2repr(self, pkt, x):
+		return dict((k, v) for k, v in x.items() if v is not None)
+
+class RTapData(FieldListField):
+	def __init__(self, name, default, fld_pairs, length_from=None, count_from=None):
+		if count_from is None:
+			count_from = lambda pkt: len(pkt.Present_flags)
+		FieldListField.__init__(self, name, None, RTapFields('Radiotap_field', None, fld_pairs), length_from, count_from)
+		self.fld_pairs = fld_pairs
+
+	def getfield(self, pkt, s): #TODO
+		c = l = None
+		if self.length_from is not None:
+			l = self.length_from(pkt)
+		elif self.count_from is not None:
+			c = self.count_from(pkt)
+
+		val = []
+		ret = ""
+		index = 0
+		self.flds = []
+		if l is not None:
+			s,ret = s[:l],s[l:]
+
+		while s:
+			if c is not None:
+				if c <= 0:
+					break
+				c -= 1
+			fld = RTapFields('Radiotap_field', None, self.fld_pairs, index)
+			self.flds.append(fld)
+			s,v = fld.getfield(pkt, s)
+			val.append(v)
+			index += 1
+		return s+ret, val
 
 # TODO(ivanlei): This fields_desc does not cover chained present flags decode will fail in this cases
 scapy.layers.dot11.RadioTap.name = '802.11 RadioTap'
@@ -74,28 +194,33 @@ scapy.layers.dot11.RadioTap.fields_desc = [
 	ByteField('version', 0),
 	ByteField('pad', 0),
 	LEShortField('RadioTap_len', 0),
-	FlagsField('present', None, -32, ['TSFT','Flags','Rate','Channel','FHSS','dBm_AntSignal',
+	PresentFlagsField('Present_flags', None, FlagsField('present', None, -32, ['TSFT','Flags','Rate','Channel','FHSS','dBm_AntSignal',
 									  'dBm_AntNoise','Lock_Quality','TX_Attenuation','dB_TX_Attenuation',
 									  'dBm_TX_Power', 'Antenna', 'dB_AntSignal', 'dB_AntNoise',
 									  'b14', 'b15','b16','b17','b18','b19','b20','b21','b22','b23',
-									  'b24','b25','b26','b27','b28','b29','b30','Ext']),
-	PresentFlagField(LELongField('TSFT', 0), 'TSFT'),
-	PresentFlagField(ByteField('Flags', 0), 'Flags'),
-	PresentFlagField(ByteField('Rate', 0), 'Rate'),
-	PresentFlagField(ChannelFromMhzField('Channel', 0), 'Channel'),
-	PresentFlagField(LEShortField('Channel_flags', 0), 'Channel'),
-	PresentFlagField(ByteField('FHSS_hop_set', 0), 'FHSS'),
-	PresentFlagField(ByteField('FHSS_hop_pattern', 0), 'FHSS'),
-	PresentFlagField(SignedByteField('dBm_AntSignal', 0), 'dBm_AntSignal'),
-	PresentFlagField(SignedByteField('dBm_AntNoise', 0), 'dBm_AntNoise'),
-	PresentFlagField(LEShortField('Lock_Quality', 0), 'Lock_Quality'),
-	PresentFlagField(LEShortField('TX_Attenuation', 0), 'TX_Attenuation'),
-	PresentFlagField(LEShortField('db_TX_Attenuation', 0), 'dB_TX_Attenuation'),
-	PresentFlagField(SignedByteField('dBm_TX_Power', 0), 'dBm_TX_Power'),
-	PresentFlagField(ByteField('Antenna', 0), 'Antenna'),
-	PresentFlagField(ByteField('dB_AntSignal', 0), 'dB_AntSignal'),
-	PresentFlagField(ByteField('dB_AntNoise', 0), 'dB_AntNoise'),
-	PresentFlagField(LEShortField('RX_Flags', 0), 'b14')
+									  'b24','b25','b26','b27','b28','b29','b30','Ext']), None, None),
+	RTapData('Radiotap_data', None,
+		[
+			[AlignedField(LELongField('TSFT', 0), 8), 'TSFT'],
+			[ByteField('Flags', 0), 'Flags'],
+			[ByteField('Rate', 0), 'Rate'],
+			[AlignedField(ChannelFromMhzField('Channel', 0), 2), 'Channel'],
+			[LEShortField('Channel_flags', 0), 'Channel'],
+			[ByteField('FHSS_hop_set', 0), 'FHSS'],
+			[ByteField('FHSS_hop_pattern', 0), 'FHSS'],
+			[SignedByteField('dBm_AntSignal', 0), 'dBm_AntSignal'],
+			[SignedByteField('dBm_AntNoise', 0), 'dBm_AntNoise'],
+			[AlignedField(LEShortField('Lock_Quality', 0)), 'Lock_Quality'],
+			[AlignedField(LEShortField('TX_Attenuation', 0)), 'TX_Attenuation'],
+			[AlignedField(LEShortField('db_TX_Attenuation', 0)), 'dB_TX_Attenuation'],
+			[SignedByteField('dBm_TX_Power', 0), 'dBm_TX_Power'],
+			[ByteField('Antenna', 0), 'Antenna'],
+			[ByteField('dB_AntSignal', 0), 'dB_AntSignal'],
+			[ByteField('dB_AntNoise', 0), 'dB_AntNoise'],
+			[AlignedField(LEShortField('RX_Flags', 0)), 'b14'],
+			[Field('MCS', 0, '3B'), 'b19'],
+			[AlignedField(Field('A-MPDU', 0, '<IHBB'), 4), 'b20']
+		])
 ]
 
 
@@ -121,6 +246,11 @@ def scapy_layers_dot11_RadioTap_pre_dissect(self, s):
 scapy.layers.dot11.RadioTap.pre_dissect = scapy_layers_dot11_RadioTap_pre_dissect
 del scapy_layers_dot11_RadioTap_pre_dissect
 
+def scapy_layers_dot11_RadioTap_post_dissect(self, s):
+	for k, v in self.Radiotap_data[0].items():
+		setattr(self, k, v)
+scapy.layers.dot11.RadioTap.post_dissection = scapy_layers_dot11_RadioTap_post_dissect
+del scapy_layers_dot11_RadioTap_post_dissect
 
 class Dot11EltRates(Packet):
 	"""The rates member contains an array of supported rates"""
