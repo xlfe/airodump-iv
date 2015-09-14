@@ -23,7 +23,8 @@ class LESignedShortField(Field):
 		Field.__init__(self, name, default, '<h')
 
 def scapy_flags_field_hasflag(self, pkt, x, val):
-	return val in self.i2repr(pkt, x)
+	return (1 << self.names.index([val])) & x
+
 FlagsField.hasflag = scapy_flags_field_hasflag
 del scapy_flags_field_hasflag
 
@@ -39,7 +40,7 @@ def scapy_packet_Packet_hasflag(self, field_name, value):
 scapy.packet.Packet.hasflag = scapy_packet_Packet_hasflag
 del scapy_packet_Packet_hasflag
 
-# fix scapy's endianness problem on big-endian host (make rev effective)
+# fix scapy's endianness problem on big-endian host (make rev take effect)
 def scapy_fields_BitField_getfield(self, pkt, s):
 		if type(s) is tuple:
 			s,bn = s
@@ -88,7 +89,7 @@ class ChannelFromMhzField(LEShortField):
 	def m2i(self, pkt, x):
 		return min(14, max(1, (x - 2407) / 5))
 
-
+# list of FlagsField
 class PresentFlagsField(FieldListField):
 	def __init__(self, name, default, field, length_from=None, count_from=None):
 		FieldListField.__init__(self, name, default, field, length_from=None, count_from=None)
@@ -107,9 +108,12 @@ class PresentFlagsField(FieldListField):
 				break
 		return s, val
 
-def packet_hasPresentFlag(self, value, index=0):
-	field, val = self.getfield_and_val('Present_flags')
-	return field.field.hasflag(self, val[index], value)
+	def hasflag(self, pkt, x, val, index = 0):
+		return self.field.hasflag(pkt, x[index], val)
+
+def packet_hasPresentFlag(self, val, index = 0):
+	field, x = self.getfield_and_val('Present_flags')
+	return field.hasflag(self, x, val, index)
 
 # adjust offset to read field data when alignment required
 class AlignedField:
@@ -138,16 +142,19 @@ class RTapFields(Field):
 		if default is None:
 			default = []
 		Field.__init__(self, name, default)
-		self.flds = []
 		self.index = index # position in all RTapFields List
-		for field, flag_name in flds:
-			self.flds.append(PresentField(field, flag_name, index))
+		self.pairs = flds
 
 	def getfield(self, pkt, s):
-		val = OrderedDict()
-		for field in self.flds:
-			s,v = field.getfield(pkt, s)
-			val[field.name] = v
+		val = dict()
+		field, x = pkt.getfield_and_val('Present_flags')
+		present_field = field.field
+		x = x[self.index]
+
+		for field, flag_name in self.pairs:
+			if present_field.hasflag(pkt, x, flag_name):
+				s,v = field.getfield(pkt, s)
+				val[field.name] = v
 		return s, val
 
 	def i2repr(self, pkt, x):
@@ -176,9 +183,8 @@ class RTapData(FieldListField):
 
 		while s:
 			if c is not None:
-				if c <= 0:
+				if index >= c:
 					break
-				c -= 1
 			fld = RTapFields('Radiotap_field', None, self.fld_pairs, index)
 			self.flds.append(fld)
 			s,v = fld.getfield(pkt, s)
