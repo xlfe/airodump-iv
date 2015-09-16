@@ -155,6 +155,8 @@ class RTapFields(Field):
 			if present_field.hasflag(pkt, x, flag_name):
 				s,v = field.getfield(pkt, s)
 				val[field.name] = v
+			else:
+				val[field.name] = None
 		return s, val
 
 	def i2repr(self, pkt, x):
