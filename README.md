@@ -1,9 +1,9 @@
-airodump-iv
+airodump-log
 ===========
 
 A python implementation of airodump-ng - the classic wifi sniffing tool.
 
-airodump-iv is probably inferior in a lot of ways to airodump-ng but is being written as a learning tool.  It might also be useful to python developers interested in wifi sniffing.
+airodump-log is designed to detect interesting 80211 events and log
 
 Currently the only feature in airodump-iv not in airodump-ng is clearly identifying the SSIDs for hidden networks (when possible).
 
